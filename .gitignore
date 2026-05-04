@@ -1,0 +1,12 @@
+.idea
+*/__pycache__
+__pycache__
+src/data/datasets
+src/baselines/results
+src/wandb
+.ipynb_checkpoints
+
+*.egg-info
+*.log
+
+outputs/**/checkpoint*.pth
