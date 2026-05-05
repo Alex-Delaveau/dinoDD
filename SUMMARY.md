@@ -54,25 +54,26 @@
 
 | Field | Value |
 |-------|-------|
-| Run name | `dino-aqua20-20260505_120314` |
-| PID | 13486 |
-| Output dir | `/home/alex/internship/dino/outputs/dino-aqua20-20260505_120314/` |
-| Log file | `/home/alex/internship/dino/outputs/dino-aqua20-20260505_120314/train.log` |
+| Run name | `dino-aqua20-20260505_120658` |
+| PID | 15786 |
+| Output dir | `/home/alex/internship/dino/outputs/dino-aqua20-20260505_120658/` |
+| Log file | `/home/alex/internship/dino/outputs/dino-aqua20-20260505_120658/train.log` |
 | wandb project | `dino-aqua20` |
-| wandb run URL | https://wandb.ai/alex26delaveau-lyon-2-/dino-aqua20/runs/2gklqfif |
-| Epoch 0 loss | ~10.797 (expected; teacher temp is still very low during warmup) |
+| wandb run URL | https://wandb.ai/alex26delaveau-lyon-2-/dino-aqua20/runs/0zvrv54f |
+| Epoch 0 loss | ~10.797 (expected; teacher temp is still in linear warmup) |
+| Epochs 1–4 | 10.85 → 10.96 → 11.02 → 11.07 (rising during LR warmup, expected) |
 
 ## How to monitor
 
 ```bash
 # Tail the log
-tail -f /home/alex/internship/dino/outputs/dino-aqua20-20260505_120314/train.log
+tail -f /home/alex/internship/dino/outputs/dino-aqua20-20260505_120658/train.log
 
 # View wandb dashboard
-# https://wandb.ai/alex26delaveau-lyon-2-/dino-aqua20/runs/2gklqfif
+# https://wandb.ai/alex26delaveau-lyon-2-/dino-aqua20/runs/0zvrv54f
 
 # Kill if needed
-kill 13486
+kill 15786
 ```
 
 ## kNN eval timing
