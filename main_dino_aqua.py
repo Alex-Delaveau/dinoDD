@@ -602,7 +602,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 
         # per-iteration wandb logging
         if args.use_wandb and utils.is_main_process():
-            grad_norm = float(param_norms) if param_norms is not None else 0.0
+            # param_norms is a list of per-parameter L2 norms returned by clip_gradients
+            grad_norm = float(max(param_norms)) if param_norms else 0.0
             wandb.log({
                 'iter/loss': loss.item(),
                 'iter/lr': optimizer.param_groups[0]['lr'],
