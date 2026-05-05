@@ -10,3 +10,5 @@ src/wandb
 *.log
 
 outputs/**/checkpoint*.pth
+wandb/
+claude/

@@ -177,6 +177,9 @@ def get_args_parser():
     parser.add_argument('--distilled_data_path', default=None, type=str,
     help='Path to distilled dataset .pt file (with "images" and "labels" keys). '
          'If set, overrides --data_path.')
+    
+    parser.add_argument('--num_dataset_repeats', default=10, type=int,
+        help='Number of times to repeat the dataset.')
 
     # W&B parameters
     parser.add_argument('--use_wandb', type=utils.bool_flag, default=False,
@@ -248,7 +251,7 @@ def train_dino(args):
             distilled_data["labels"].long(),
             transform=transform,
         )
-        dataset = RepeatDataset(dataset, repeat=10) 
+        dataset = RepeatDataset(dataset, repeat=args.num_dataset_repeats)
     else:
         dataset = datasets.ImageFolder(args.data_path, transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
@@ -446,18 +449,17 @@ def _extract_features(backbone_model, data_loader):
 @torch.no_grad()
 def run_knn_eval(backbone_model, args, epoch):
     """
-    kNN evaluation using distilled images as memory bank and the real test set as queries.
+    kNN evaluation.
 
-    Memory bank : --distilled_data_path  (20 distilled images, 1 per class)
-    Queries     : --knn_test_data_path   (ImageFolder, 1612 real test images)
-
-    ImageFolder sorts class dirs alphabetically, matching the integer labels 0-19
-    in the distilled .pth file (both derived from the same AQUA20 class ordering).
+    Memory bank:
+      - distilled mode: --distilled_data_path (.pth, 1 image/class)
+      - real-data mode: --data_path (ImageFolder train set)
+    Queries: --knn_test_data_path (ImageFolder test set)
     """
-    if not args.distilled_data_path:
-        return {}
     if not args.knn_test_data_path:
         print("WARNING: --knn_test_data_path not set; skipping kNN eval.")
+        return {}
+    if not args.distilled_data_path and not args.data_path:
         return {}
 
     eval_transform = transforms.Compose([
@@ -467,21 +469,34 @@ def run_knn_eval(backbone_model, args, epoch):
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
 
-    # ── Memory bank: distilled images ────────────────────────────────────────
-    distilled_data = torch.load(args.distilled_data_path, map_location='cpu')
-    raw_images = distilled_data['images']   # (N_train, C, H, W)
-    train_labels = distilled_data['labels'].long()
-    N_train = len(train_labels)
-
     backbone_model.eval()
-    train_imgs = torch.stack([
-        eval_transform(transforms.functional.to_pil_image(raw_images[i]))
-        for i in range(N_train)
-    ]).cuda()
-    train_feats = backbone_model.backbone(train_imgs)
-    if isinstance(train_feats, tuple):
-        train_feats = train_feats[0]
-    train_feats = F.normalize(train_feats, dim=1, p=2)  # (N_train, D)
+
+    # ── Memory bank ───────────────────────────────────────────────────────────
+    if args.distilled_data_path:
+        distilled_data = torch.load(args.distilled_data_path, map_location='cpu')
+        raw_images = distilled_data['images']   # (N_train, C, H, W)
+        train_labels = distilled_data['labels'].long()
+        N_train = len(train_labels)
+        train_imgs = torch.stack([
+            eval_transform(transforms.functional.to_pil_image(raw_images[i]))
+            for i in range(N_train)
+        ]).cuda()
+        train_feats = backbone_model.backbone(train_imgs)
+        if isinstance(train_feats, tuple):
+            train_feats = train_feats[0]
+        train_feats = F.normalize(train_feats, dim=1, p=2)  # (N_train, D)
+    else:
+        train_dataset = datasets.ImageFolder(args.data_path, transform=eval_transform)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size_per_gpu,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+        train_feats, train_labels = _extract_features(backbone_model, train_loader)
+        train_feats = train_feats.cuda()
+        N_train = len(train_labels)
 
     # ── Query set: real test images ───────────────────────────────────────────
     test_dataset = datasets.ImageFolder(args.knn_test_data_path, transform=eval_transform)
@@ -570,13 +585,17 @@ def run_knn_eval(backbone_model, args, epoch):
         # test points (small), train points (large star markers)
         test_mask = all_split == 'test'
         train_mask = all_split == 'train'
-        sc = ax_tsne.scatter(coords[test_mask, 0], coords[test_mask, 1],
-                             c=all_labels_np[test_mask], cmap='tab20',
-                             s=15, alpha=0.6, linewidths=0)
+        # Train d'abord, en gris léger pour donner le contexte
         ax_tsne.scatter(coords[train_mask, 0], coords[train_mask, 1],
-                        c=all_labels_np[train_mask], cmap='tab20',
-                        s=180, marker='*', edgecolors='k', linewidths=0.8)
+                        c='lightgray', s=8, alpha=0.3, linewidths=0,
+                        zorder=1, label='train')
+        # Test par-dessus, bien visible
+        sc = ax_tsne.scatter(coords[test_mask, 0], coords[test_mask, 1],
+                            c=all_labels_np[test_mask], cmap='tab20',
+                            s=40, alpha=0.9, edgecolors='k', linewidths=0.3,
+                            zorder=2, label='test')
         fig_tsne.colorbar(sc, ax=ax_tsne, label='class')
+        ax_tsne.legend()
         ax_tsne.set_title(f't-SNE: train (★) + test (·) features — epoch {epoch}')
         fig_tsne.tight_layout()
         metrics['tsne'] = wandb.Image(fig_tsne) if args.use_wandb else None
