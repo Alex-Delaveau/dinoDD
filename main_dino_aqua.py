@@ -223,6 +223,13 @@ def train_dino(args):
                 name=args.wandb_run_name,
                 config=vars(args),
             )
+            # Define custom x-axes so iter/* and epoch/* can be logged independently
+            # without step monotonicity conflicts.
+            wandb.define_metric("global_step")
+            wandb.define_metric("iter/*", step_metric="global_step")
+            wandb.define_metric("epoch_num")
+            wandb.define_metric("epoch/*", step_metric="epoch_num")
+            wandb.define_metric("knn/*", step_metric="epoch_num")
             print(f"wandb run: {wandb.run.name} ({wandb.run.url})")
 
     # ============ preparing data ... ============
@@ -395,8 +402,8 @@ def train_dino(args):
         # ============ wandb per-epoch logging ... ============
         if args.use_wandb and utils.is_main_process():
             wandb.log(
-                {f'epoch/{k}': v for k, v in train_stats.items()},
-                step=epoch,
+                {**{f'epoch/{k}': v for k, v in train_stats.items()},
+                 'epoch_num': epoch},
             )
 
         # ============ periodic kNN evaluation ... ============
@@ -405,13 +412,10 @@ def train_dino(args):
                 and utils.is_main_process()):
             knn_metrics = run_knn_eval(teacher_without_ddp, args, epoch)
             if knn_metrics and args.use_wandb:
-                log_knn = {}
+                log_knn = {'epoch_num': epoch}
                 for k, v in knn_metrics.items():
-                    if isinstance(v, (int, float)):
-                        log_knn[f'knn/{k}'] = v
-                    else:
-                        log_knn[f'knn/{k}'] = v  # wandb.Image objects
-                wandb.log(log_knn, step=epoch)
+                    log_knn[f'knn/{k}'] = v
+                wandb.log(log_knn)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -600,18 +604,19 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
 
-        # per-iteration wandb logging
+        # per-iteration wandb logging (uses "global_step" as custom x-axis)
         if args.use_wandb and utils.is_main_process():
             # param_norms is a list of per-parameter L2 norms returned by clip_gradients
             grad_norm = float(max(param_norms)) if param_norms else 0.0
             wandb.log({
+                'global_step': it,
                 'iter/loss': loss.item(),
                 'iter/lr': optimizer.param_groups[0]['lr'],
                 'iter/wd': optimizer.param_groups[0]['weight_decay'],
                 'iter/grad_norm': grad_norm,
                 'iter/teacher_temp': float(dino_loss.teacher_temp_schedule[epoch]),
                 'iter/momentum': float(m),
-            }, step=it)
+            })
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
