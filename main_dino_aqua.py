@@ -195,6 +195,9 @@ def get_args_parser():
         help='Values of k for kNN classification. Each k is capped at num_train_samples-1.')
     parser.add_argument('--knn_temperature', default=0.07, type=float,
         help='Temperature for kNN voting coefficients.')
+    parser.add_argument('--knn_test_data_path', default=None, type=str,
+        help='Path to real test set (ImageFolder layout) for kNN queries. '
+             'Memory bank comes from --distilled_data_path. Required for proper eval.')
     parser.add_argument('--num_classes', default=20, type=int,
         help='Number of classes in the dataset (20 for AQUA20).')
 
@@ -426,73 +429,101 @@ def train_dino(args):
 
 
 @torch.no_grad()
+@torch.no_grad()
+def _extract_features(backbone_model, data_loader):
+    """Extract and L2-normalize backbone features for all images in data_loader."""
+    all_feats, all_labels = [], []
+    for imgs, lbls in data_loader:
+        imgs = imgs.cuda(non_blocking=True)
+        feats = backbone_model.backbone(imgs)
+        if isinstance(feats, tuple):
+            feats = feats[0]
+        all_feats.append(F.normalize(feats, dim=1, p=2).cpu())
+        all_labels.append(lbls)
+    return torch.cat(all_feats), torch.cat(all_labels)
+
+
+@torch.no_grad()
 def run_knn_eval(backbone_model, args, epoch):
     """
-    Run kNN evaluation on the AQUA20 distilled dataset.
+    kNN evaluation using distilled images as memory bank and the real test set as queries.
 
-    Since there is only 1 image per class (IPC=1), we use all 20 images as both
-    memory bank and query set, excluding self-similarity via masking. See DECISIONS.md.
+    Memory bank : --distilled_data_path  (20 distilled images, 1 per class)
+    Queries     : --knn_test_data_path   (ImageFolder, 1612 real test images)
+
+    ImageFolder sorts class dirs alphabetically, matching the integer labels 0-19
+    in the distilled .pth file (both derived from the same AQUA20 class ordering).
     """
     if not args.distilled_data_path:
         return {}
+    if not args.knn_test_data_path:
+        print("WARNING: --knn_test_data_path not set; skipping kNN eval.")
+        return {}
 
     eval_transform = transforms.Compose([
-        transforms.Resize(224, interpolation=Image.BICUBIC),
+        transforms.Resize(256, interpolation=Image.BICUBIC),
         transforms.CenterCrop(224),
         transforms.ToTensor(),
         transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
 
+    # ── Memory bank: distilled images ────────────────────────────────────────
     distilled_data = torch.load(args.distilled_data_path, map_location='cpu')
-    raw_images = distilled_data['images']   # (N, C, H, W)
-    labels = distilled_data['labels'].long()
-    N = len(labels)
+    raw_images = distilled_data['images']   # (N_train, C, H, W)
+    train_labels = distilled_data['labels'].long()
+    N_train = len(train_labels)
 
-    # Extract backbone features (no DINO head)
     backbone_model.eval()
-    imgs_tensor = torch.stack([
+    train_imgs = torch.stack([
         eval_transform(transforms.functional.to_pil_image(raw_images[i]))
-        for i in range(N)
+        for i in range(N_train)
     ]).cuda()
-    features = backbone_model.backbone(imgs_tensor)  # (N, embed_dim)
-    if isinstance(features, tuple):
-        features = features[0]
-    features = F.normalize(features, dim=1, p=2)  # (N, D)
-    labels_cuda = labels.cuda()
+    train_feats = backbone_model.backbone(train_imgs)
+    if isinstance(train_feats, tuple):
+        train_feats = train_feats[0]
+    train_feats = F.normalize(train_feats, dim=1, p=2)  # (N_train, D)
 
-    # Similarity matrix (N x N), mask diagonal to avoid self-retrieval
-    sim = torch.mm(features, features.t())  # (N, N)
-    sim.fill_diagonal_(-1e9)
+    # ── Query set: real test images ───────────────────────────────────────────
+    test_dataset = datasets.ImageFolder(args.knn_test_data_path, transform=eval_transform)
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    test_feats_cpu, test_labels_cpu = _extract_features(backbone_model, test_loader)
+    test_feats = test_feats_cpu.cuda()
+    test_labels = test_labels_cpu.cuda()
+    N_test = len(test_labels)
+
+    # ── kNN classification ────────────────────────────────────────────────────
+    # sim[i, j] = cosine similarity between test image i and train image j
+    sim = torch.mm(test_feats, train_feats.t())  # (N_test, N_train)
 
     num_classes = args.num_classes
     metrics = {}
+    best_preds = None  # store preds for smallest k (for plots)
 
-    for k in args.knn_nb_knn:
-        k_eff = min(k, N - 1)  # cap at N-1 (N=20 → max 19)
-        retrieval_one_hot = torch.zeros(k_eff, num_classes).cuda()
+    for k in sorted(args.knn_nb_knn):
+        k_eff = min(k, N_train)  # cap at N_train=20
+        distances, indices = sim.topk(k_eff, dim=1, largest=True, sorted=True)  # (N_test, k_eff)
+        retrieved_neighbors = train_labels.cuda()[indices]  # (N_test, k_eff)
 
-        distances, indices = sim.topk(k_eff, dim=1, largest=True, sorted=True)  # (N, k_eff)
-        retrieved_neighbors = labels_cuda[indices]  # (N, k_eff)
-
-        retrieval_one_hot = retrieval_one_hot.unsqueeze(0).expand(N, -1, -1).clone()
-        retrieval_one_hot.zero_()
-        retrieval_one_hot.scatter_(2, retrieved_neighbors.unsqueeze(2), 1)
+        ro = torch.zeros(N_test, k_eff, num_classes, device=train_feats.device)
+        ro.scatter_(2, retrieved_neighbors.unsqueeze(2), 1)
 
         T = args.knn_temperature
-        distances_transform = distances.clone().div_(T).exp_()  # (N, k_eff)
-        probs = torch.sum(
-            retrieval_one_hot * distances_transform.unsqueeze(2),
-            dim=1,
-        )  # (N, num_classes)
-        _, predictions = probs.sort(1, descending=True)  # (N, num_classes)
+        dt = distances.clone().div_(T).exp_()  # (N_test, k_eff)
+        probs = (ro * dt.unsqueeze(2)).sum(dim=1)  # (N_test, num_classes)
+        _, predictions = probs.sort(1, descending=True)
 
-        correct = predictions.eq(labels_cuda.view(-1, 1))
-        top1 = correct[:, 0].sum().item() * 100.0 / N
-        top5_k = min(5, k_eff)
-        top5 = correct[:, :top5_k].any(dim=1).sum().item() * 100.0 / N
+        correct = predictions.eq(test_labels.view(-1, 1))
+        top1 = correct[:, 0].sum().item() * 100.0 / N_test
+        top5 = correct[:, :5].any(dim=1).sum().item() * 100.0 / N_test
 
         preds_np = predictions[:, 0].cpu().numpy()
-        labels_np = labels.numpy()
+        labels_np = test_labels_cpu.numpy()
         f1_macro = float(f1_score(labels_np, preds_np, average='macro', zero_division=0) * 100)
         f1_weighted = float(f1_score(labels_np, preds_np, average='weighted', zero_division=0) * 100)
 
@@ -501,44 +532,52 @@ def run_knn_eval(backbone_model, args, epoch):
         metrics[f'{k}nn_f1_macro'] = f1_macro
         metrics[f'{k}nn_f1_weighted'] = f1_weighted
 
-        print(f"Epoch {epoch} | {k_eff}-NN (capped from {k}): "
+        print(f"Epoch {epoch} | {k_eff}-NN (k={k}, bank={N_train}, queries={N_test}): "
               f"top1={top1:.1f}%  top5={top5:.1f}%  "
               f"F1_macro={f1_macro:.1f}%  F1_weighted={f1_weighted:.1f}%")
 
-    # Use predictions from the smallest k for confusion matrix / t-SNE
-    k_small = min(args.knn_nb_knn)
-    k_eff_small = min(k_small, N - 1)
-    distances_s, indices_s = sim.topk(k_eff_small, dim=1, largest=True, sorted=True)
-    retrieved_s = labels_cuda[indices_s]
-    ro = torch.zeros(N, k_eff_small, num_classes).cuda()
-    ro.scatter_(2, retrieved_s.unsqueeze(2), 1)
-    dt = distances_s.clone().div_(args.knn_temperature).exp_()
-    probs_s = (ro * dt.unsqueeze(2)).sum(dim=1)
-    preds_s = probs_s.argmax(dim=1).cpu().numpy()
+        if best_preds is None:
+            best_preds = preds_np  # smallest k
 
-    if _SKLEARN_AVAILABLE:
-        # Confusion matrix
-        cm = sk_confusion_matrix(labels.numpy(), preds_s, labels=list(range(num_classes)))
-        fig_cm, ax_cm = plt.subplots(figsize=(8, 7))
+    if _SKLEARN_AVAILABLE and best_preds is not None:
+        labels_np = test_labels_cpu.numpy()
+
+        # Confusion matrix (query labels vs predicted)
+        cm = sk_confusion_matrix(labels_np, best_preds, labels=list(range(num_classes)))
+        class_names = test_dataset.classes  # alphabetical, matches integer labels
+        fig_cm, ax_cm = plt.subplots(figsize=(10, 9))
         im = ax_cm.imshow(cm, interpolation='nearest', cmap='Blues')
         fig_cm.colorbar(im, ax=ax_cm)
-        ax_cm.set_title(f'kNN Confusion Matrix (epoch {epoch})')
-        ax_cm.set_xlabel('Predicted class')
-        ax_cm.set_ylabel('True class')
+        ax_cm.set_xticks(range(num_classes))
+        ax_cm.set_yticks(range(num_classes))
+        ax_cm.set_xticklabels(class_names, rotation=45, ha='right', fontsize=7)
+        ax_cm.set_yticklabels(class_names, fontsize=7)
+        ax_cm.set_title(f'kNN Confusion Matrix — epoch {epoch} (k={sorted(args.knn_nb_knn)[0]})')
+        ax_cm.set_xlabel('Predicted')
+        ax_cm.set_ylabel('True')
         fig_cm.tight_layout()
         metrics['confusion_matrix'] = wandb.Image(fig_cm) if args.use_wandb else None
         plt.close(fig_cm)
 
-        # t-SNE
-        feats_np = features.cpu().numpy()
-        perplexity = min(5, N - 1)  # perplexity must be < N
+        # t-SNE of train (distilled) + test features combined, colored by class
+        all_feats_np = torch.cat([train_feats.cpu(), test_feats_cpu], dim=0).numpy()
+        all_labels_np = np.concatenate([train_labels.numpy(), labels_np])
+        all_split = np.array(['train'] * N_train + ['test'] * N_test)
+        perplexity = min(30, len(all_feats_np) - 1)
         tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, n_iter=1000)
-        coords = tsne.fit_transform(feats_np)
-        fig_tsne, ax_tsne = plt.subplots(figsize=(7, 7))
-        scatter = ax_tsne.scatter(coords[:, 0], coords[:, 1],
-                                  c=labels.numpy(), cmap='tab20', s=120, edgecolors='k', linewidths=0.5)
-        fig_tsne.colorbar(scatter, ax=ax_tsne, label='class')
-        ax_tsne.set_title(f't-SNE of backbone features (epoch {epoch})')
+        coords = tsne.fit_transform(all_feats_np)
+        fig_tsne, ax_tsne = plt.subplots(figsize=(9, 8))
+        # test points (small), train points (large star markers)
+        test_mask = all_split == 'test'
+        train_mask = all_split == 'train'
+        sc = ax_tsne.scatter(coords[test_mask, 0], coords[test_mask, 1],
+                             c=all_labels_np[test_mask], cmap='tab20',
+                             s=15, alpha=0.6, linewidths=0)
+        ax_tsne.scatter(coords[train_mask, 0], coords[train_mask, 1],
+                        c=all_labels_np[train_mask], cmap='tab20',
+                        s=180, marker='*', edgecolors='k', linewidths=0.8)
+        fig_tsne.colorbar(sc, ax=ax_tsne, label='class')
+        ax_tsne.set_title(f't-SNE: train (★) + test (·) features — epoch {epoch}')
         fig_tsne.tight_layout()
         metrics['tsne'] = wandb.Image(fig_tsne) if args.use_wandb else None
         plt.close(fig_tsne)
