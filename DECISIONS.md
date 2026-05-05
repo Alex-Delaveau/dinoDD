@@ -22,15 +22,13 @@ During training, `DataAugmentationDINO` already handles arbitrary input resoluti
 
 ## Train/val split for kNN evaluation
 
-**Problem**: With only 1 image per class (IPC=1, 20 total images), an 80/20 stratified split would leave 0.2 images per class per split — impossible.
+**Memory bank (train)**: The 20 distilled images from `--distilled_data_path` (1 per class, IPC=1).
 
-**Decision**: Use all 20 images as **both** the memory bank and the query set.
+**Query set (test)**: The real AQUA20 test images at `--knn_test_data_path` (`/home/alex/internship/datasets/aqua20/data/aqua20/test`), 1612 images across 20 classes — a proper held-out evaluation set.
 
-**Self-retrieval mitigation**: The diagonal of the similarity matrix is masked to `-1e9` before top-k selection. This means each image's nearest neighbor is drawn from the other 19 images.
+**Class ordering**: `datasets.ImageFolder` sorts class directories alphabetically. The 20 alphabetical class names map to integer labels 0–19, which matches the distilled dataset's integer labels (both derived from the same AQUA20 class ordering).
 
-**Interpretation caveat**: Because the memory bank and query set are identical (minus self-retrieval), high kNN accuracy does not necessarily imply good generalization. The metric's primary use here is to track whether features are *separable* (i.e., whether training is progressing usefully), not to measure generalization.
-
-**k capping**: All k values in `--knn_nb_knn` are capped at `N - 1 = 19` since there are only 19 non-self neighbors available.
+**k capping**: All k values are capped at `min(k, N_train) = min(k, 20)` since the memory bank only has 20 images.
 
 ## Student arch choice
 

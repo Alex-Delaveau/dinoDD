@@ -54,31 +54,27 @@
 
 | Field | Value |
 |-------|-------|
-| Run name | `dino-aqua20-20260505_120658` |
-| PID | 15786 |
-| Output dir | `/home/alex/internship/dino/outputs/dino-aqua20-20260505_120658/` |
-| Log file | `/home/alex/internship/dino/outputs/dino-aqua20-20260505_120658/train.log` |
+| Run name | `dino-aqua20-20260505_121606` |
+| PID | 21157 |
+| Output dir | `/home/alex/internship/dino/outputs/dino-aqua20-20260505_121606/` |
+| Log file | `/home/alex/internship/dino/outputs/dino-aqua20-20260505_121606/train.log` |
 | wandb project | `dino-aqua20` |
-| wandb run URL | https://wandb.ai/alex26delaveau-lyon-2-/dino-aqua20/runs/0zvrv54f |
-| Epoch 0 loss | ~10.797 (expected; teacher temp is still in linear warmup) |
-| Epochs 1–4 | 10.85 → 10.96 → 11.02 → 11.07 (rising during LR warmup, expected) |
 
 ## How to monitor
 
 ```bash
-# Tail the log
-tail -f /home/alex/internship/dino/outputs/dino-aqua20-20260505_120658/train.log
-
-# View wandb dashboard
-# https://wandb.ai/alex26delaveau-lyon-2-/dino-aqua20/runs/0zvrv54f
-
-# Kill if needed
-kill 15786
+tail -f /home/alex/internship/dino/outputs/dino-aqua20-20260505_121606/train.log
+kill 21157  # to stop
 ```
 
-## kNN eval timing
+## kNN eval (epoch 9 confirmed)
 
-First kNN eval will run at epoch 10. Confusion matrix and t-SNE plots will appear in wandb at that point.
+```
+Epoch 9 | 10-NN (bank=20 distilled, queries=1612 real test):
+  top1=15.3%  top5=45.4%  F1_macro=6.2%  F1_weighted=16.7%
+```
+
+Random baseline for 20 classes ≈ 5% top-1 — model is above chance even at epoch 9 (still in LR warmup). F1 macro will improve once teacher temp finishes warming up (~epoch 30).
 
 ## Limitations
 
