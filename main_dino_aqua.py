@@ -34,6 +34,23 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
+try:
+    from sklearn.metrics import f1_score, confusion_matrix as sk_confusion_matrix
+    from sklearn.manifold import TSNE
+    _SKLEARN_AVAILABLE = True
+except ImportError:
+    _SKLEARN_AVAILABLE = False
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 
 from torch.utils.data import Dataset
 
@@ -161,6 +178,26 @@ def get_args_parser():
     help='Path to distilled dataset .pt file (with "images" and "labels" keys). '
          'If set, overrides --data_path.')
 
+    # W&B parameters
+    parser.add_argument('--use_wandb', type=utils.bool_flag, default=False,
+        help='Enable Weights & Biases logging.')
+    parser.add_argument('--wandb_project', default='dino-aqua20', type=str,
+        help='W&B project name.')
+    parser.add_argument('--wandb_entity', default=None, type=str,
+        help='W&B entity (username or team). None uses the default entity.')
+    parser.add_argument('--wandb_run_name', default=None, type=str,
+        help='W&B run name. None lets W&B auto-generate.')
+
+    # kNN evaluation parameters
+    parser.add_argument('--knn_eval_freq', default=10, type=int,
+        help='Run kNN evaluation every N epochs. 0 disables kNN eval.')
+    parser.add_argument('--knn_nb_knn', default=[10, 20, 100, 200], nargs='+', type=int,
+        help='Values of k for kNN classification. Each k is capped at num_train_samples-1.')
+    parser.add_argument('--knn_temperature', default=0.07, type=float,
+        help='Temperature for kNN voting coefficients.')
+    parser.add_argument('--num_classes', default=20, type=int,
+        help='Number of classes in the dataset (20 for AQUA20).')
+
     return parser
 
 
@@ -170,6 +207,23 @@ def train_dino(args):
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
+
+    # ============ optional wandb init ... ============
+    if args.use_wandb and utils.is_main_process():
+        if not _WANDB_AVAILABLE:
+            print("WARNING: wandb not installed, disabling wandb logging.")
+            args.use_wandb = False
+        elif os.environ.get('WANDB_DISABLED', '').lower() in ('true', '1', 'yes'):
+            print("WARNING: WANDB_DISABLED is set, disabling wandb logging.")
+            args.use_wandb = False
+        else:
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                config=vars(args),
+            )
+            print(f"wandb run: {wandb.run.name} ({wandb.run.url})")
 
     # ============ preparing data ... ============
     transform = DataAugmentationDINO(
@@ -337,9 +391,34 @@ def train_dino(args):
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
+
+        # ============ wandb per-epoch logging ... ============
+        if args.use_wandb and utils.is_main_process():
+            wandb.log(
+                {f'epoch/{k}': v for k, v in train_stats.items()},
+                step=epoch,
+            )
+
+        # ============ periodic kNN evaluation ... ============
+        if (args.knn_eval_freq > 0
+                and (epoch + 1) % args.knn_eval_freq == 0
+                and utils.is_main_process()):
+            knn_metrics = run_knn_eval(teacher_without_ddp, args, epoch)
+            if knn_metrics and args.use_wandb:
+                log_knn = {}
+                for k, v in knn_metrics.items():
+                    if isinstance(v, (int, float)):
+                        log_knn[f'knn/{k}'] = v
+                    else:
+                        log_knn[f'knn/{k}'] = v  # wandb.Image objects
+                wandb.log(log_knn, step=epoch)
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+
+    if args.use_wandb and utils.is_main_process():
+        wandb.finish()
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
@@ -347,9 +426,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for local_it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         # update weight decay and learning rate according to their schedule
-        it = len(data_loader) * epoch + it  # global training iteration
+        it = len(data_loader) * epoch + local_it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
@@ -398,6 +477,19 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+
+        # per-iteration wandb logging
+        if args.use_wandb and utils.is_main_process():
+            grad_norm = float(param_norms) if param_norms is not None else 0.0
+            wandb.log({
+                'iter/loss': loss.item(),
+                'iter/lr': optimizer.param_groups[0]['lr'],
+                'iter/wd': optimizer.param_groups[0]['weight_decay'],
+                'iter/grad_norm': grad_norm,
+                'iter/teacher_temp': float(dino_loss.teacher_temp_schedule[epoch]),
+                'iter/momentum': float(m),
+            }, step=it)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
