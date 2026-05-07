@@ -9,6 +9,6 @@ src/wandb
 *.egg-info
 *.log
 
-outputs/**/checkpoint*.pth
+outputs/**/*.pth
 wandb/
 claude/

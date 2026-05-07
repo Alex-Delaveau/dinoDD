@@ -27,6 +27,14 @@ import utils
 import vision_transformer as vits
 
 
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def extract_feature_pipeline(args):
     # ============ preparing data ... ============
     transform = pth_transforms.Compose([
@@ -36,21 +44,22 @@ def extract_feature_pipeline(args):
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
     dataset_train = ReturnIndexDataset(os.path.join(args.data_path, "train"), transform=transform)
-    dataset_val = ReturnIndexDataset(os.path.join(args.data_path, "val"), transform=transform)
+    dataset_val = ReturnIndexDataset(os.path.join(args.data_path, "test"), transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset_train, shuffle=False)
+    pin_memory = args.device.type == "cuda"
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train,
         sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=False,
     )
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=False,
     )
     print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
@@ -67,15 +76,15 @@ def extract_feature_pipeline(args):
     else:
         print(f"Architecture {args.arch} non supported")
         sys.exit(1)
-    model.cuda()
+    model.to(args.device)
     utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
     model.eval()
 
     # ============ extract features ... ============
     print("Extracting features for train set...")
-    train_features = extract_features(model, data_loader_train, args.use_cuda)
+    train_features = extract_features(model, data_loader_train, args.device)
     print("Extracting features for val set...")
-    test_features = extract_features(model, data_loader_val, args.use_cuda)
+    test_features = extract_features(model, data_loader_val, args.device)
 
     if utils.get_rank() == 0:
         train_features = nn.functional.normalize(train_features, dim=1, p=2)
@@ -93,12 +102,12 @@ def extract_feature_pipeline(args):
 
 
 @torch.no_grad()
-def extract_features(model, data_loader, use_cuda=True, multiscale=False):
+def extract_features(model, data_loader, device, multiscale=False):
     metric_logger = utils.MetricLogger(delimiter="  ")
     features = None
     for samples, index in metric_logger.log_every(data_loader, 10):
-        samples = samples.cuda(non_blocking=True)
-        index = index.cuda(non_blocking=True)
+        samples = samples.to(device, non_blocking=True)
+        index = index.to(device, non_blocking=True)
         if multiscale:
             feats = utils.multi_scale(samples, model)
         else:
@@ -107,8 +116,8 @@ def extract_features(model, data_loader, use_cuda=True, multiscale=False):
         # init storage feature matrix
         if dist.get_rank() == 0 and features is None:
             features = torch.zeros(len(data_loader.dataset), feats.shape[-1])
-            if use_cuda:
-                features = features.cuda(non_blocking=True)
+            if device.type != "cpu":
+                features = features.to(device, non_blocking=True)
             print(f"Storing features into tensor of shape {features.shape}")
 
         # get indexes from all processes
@@ -132,7 +141,7 @@ def extract_features(model, data_loader, use_cuda=True, multiscale=False):
 
         # update storage feature matrix
         if dist.get_rank() == 0:
-            if use_cuda:
+            if device.type != "cpu":
                 features.index_copy_(0, index_all, torch.cat(output_l))
             else:
                 features.index_copy_(0, index_all.cpu(), torch.cat(output_l).cpu())
@@ -211,12 +220,16 @@ if __name__ == '__main__':
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--data_path', default='/path/to/imagenet/', type=str)
+    parser.add_argument('--num_classes', default=1000, type=int, help='Number of classes in the dataset.')
     args = parser.parse_args()
 
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
+    args.device = get_device() if args.use_cuda else torch.device("cpu")
+    print(f"Using device: {args.device}")
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
-    cudnn.benchmark = True
+    if torch.cuda.is_available():
+        cudnn.benchmark = True
 
     if args.load_features:
         train_features = torch.load(os.path.join(args.load_features, "trainfeat.pth"))
@@ -229,14 +242,14 @@ if __name__ == '__main__':
 
     if utils.get_rank() == 0:
         if args.use_cuda:
-            train_features = train_features.cuda()
-            test_features = test_features.cuda()
-            train_labels = train_labels.cuda()
-            test_labels = test_labels.cuda()
+            train_features = train_features.to(args.device)
+            test_features = test_features.to(args.device)
+            train_labels = train_labels.to(args.device)
+            test_labels = test_labels.to(args.device)
 
         print("Features are ready!\nStart the k-NN classification.")
         for k in args.nb_knn:
             top1, top5 = knn_classifier(train_features, train_labels,
-                test_features, test_labels, k, args.temperature)
+                test_features, test_labels, k, args.temperature, args.num_classes)
             print(f"{k}-NN classifier result: Top1: {top1}, Top5: {top5}")
     dist.barrier()
