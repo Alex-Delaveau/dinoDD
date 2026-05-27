@@ -38,6 +38,7 @@ torchrun \
     --use_bn_in_head true \
     --data_path "$DATA_PATH" \
     --epochs 5 \
+    --warmup_epochs 1 \
     --batch_size_per_gpu 64 \
     --num_workers 8 \
     --output_dir "$OUTPUT_DIR" \
