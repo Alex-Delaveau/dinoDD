@@ -43,6 +43,7 @@ except ImportError:
 try:
     from sklearn.metrics import f1_score, confusion_matrix as sk_confusion_matrix
     from sklearn.manifold import TSNE
+    from sklearn.linear_model import LogisticRegression
     _SKLEARN_AVAILABLE = True
 except ImportError:
     _SKLEARN_AVAILABLE = False
@@ -204,7 +205,42 @@ def get_args_parser():
     parser.add_argument('--num_classes', default=20, type=int,
         help='Number of classes in the dataset (20 for AQUA20).')
 
+    # Linear probe evaluation parameters
+    parser.add_argument('--lp_eval_freq', default=10, type=int,
+        help='Run linear probe evaluation every N epochs. 0 disables LP eval.')
+    parser.add_argument('--lp_train_frac', default=0.05, type=float,
+        help='Fraction of real training data for LP (stratified, floor=min(5,n_class)).')
+    parser.add_argument('--lp_split_seed', default=42, type=int,
+        help='Random seed for stratified LP train subset.')
+    parser.add_argument('--lp_real_data_path', default=None, type=str,
+        help='ImageFolder root for real AQUA20 data used in LP eval. '
+             'Falls back to --data_path when not set (Run A). '
+             'Required when --distilled_data_path is set (Run B).')
+
     return parser
+
+
+def _build_lp_subset(dataset, fraction, seed, min_per_class=5):
+    """Stratified subset with floor guarantee: at least min(min_per_class, n_class) per class.
+    Returns (Subset, per_class_counts dict)."""
+    from collections import defaultdict
+    import random as _rnd
+    rng = _rnd.Random(seed)
+
+    targets = [s[1] for s in dataset.samples]
+    class_to_indices = defaultdict(list)
+    for idx, label in enumerate(targets):
+        class_to_indices[label].append(idx)
+
+    indices, per_class_counts = [], {}
+    for cls, idx_list in sorted(class_to_indices.items()):
+        n = len(idx_list)
+        k = max(min(min_per_class, n), round(fraction * n))
+        sampled = rng.sample(idx_list, k)
+        indices.extend(sampled)
+        per_class_counts[cls] = k
+
+    return torch.utils.data.Subset(dataset, sorted(indices)), per_class_counts
 
 
 def train_dino(args):
@@ -423,6 +459,18 @@ def train_dino(args):
                     log_knn[f'knn/{k}'] = v
                 wandb.log(log_knn)
 
+        # ============ periodic linear probe evaluation ... ============
+        if (args.lp_eval_freq > 0
+                and (epoch + 1) % args.lp_eval_freq == 0
+                and utils.is_main_process()):
+            lp_metrics = run_lp_eval(teacher_without_ddp, args, epoch)
+            if lp_metrics:
+                lp_log_stats = {**{f'lp_{k}': v for k, v in lp_metrics.items()}, 'epoch': epoch}
+                with (Path(args.output_dir) / "log.txt").open("a") as f:
+                    f.write(json.dumps(lp_log_stats) + "\n")
+                if args.use_wandb:
+                    wandb.log({'epoch_num': epoch, **{f'lp/{k}': v for k, v in lp_metrics.items()}})
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -603,6 +651,89 @@ def run_knn_eval(backbone_model, args, epoch):
 
     backbone_model.train()
     return metrics
+
+
+@torch.no_grad()
+def run_lp_eval(backbone_model, args, epoch):
+    """Periodic linear probe: stratified 5% train → sklearn LR → top-1/top-5 on real test set."""
+    if not _SKLEARN_AVAILABLE:
+        print("WARNING: sklearn not available, skipping LP eval.")
+        return {}
+
+    real_data_path = args.lp_real_data_path or args.data_path
+    if args.distilled_data_path and not args.lp_real_data_path:
+        print("WARNING: --distilled_data_path set but --lp_real_data_path not set; skipping LP eval.")
+        return {}
+    if not real_data_path or not os.path.isdir(real_data_path):
+        print(f"WARNING: LP real data path '{real_data_path}' not found; skipping LP eval.")
+        return {}
+
+    eval_transform = transforms.Compose([
+        transforms.Resize(256, interpolation=Image.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+
+    backbone_model.eval()
+
+    # ── Training subset (stratified, floor=min(5, n_class)) ───────────────────
+    train_full = datasets.ImageFolder(os.path.join(real_data_path, "train"), transform=eval_transform)
+    train_subset, per_class_counts = _build_lp_subset(train_full, args.lp_train_frac, args.lp_split_seed)
+
+    # Save indices + per-class counts once (for audit)
+    indices_path = Path(args.output_dir) / "lp_train_indices.json"
+    if not indices_path.exists():
+        with open(indices_path, "w") as f:
+            json.dump({
+                "indices": list(train_subset.indices),
+                "per_class_counts": per_class_counts,
+                "total": len(train_subset),
+                "fraction": args.lp_train_frac,
+                "seed": args.lp_split_seed,
+            }, f, indent=2)
+        print(f"LP subset saved: {len(train_subset)} imgs | per-class: {per_class_counts}")
+
+    train_loader = torch.utils.data.DataLoader(
+        train_subset, batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
+    )
+
+    # ── Test set ──────────────────────────────────────────────────────────────
+    test_dir = os.path.join(real_data_path, "test")
+    if not os.path.isdir(test_dir):
+        test_dir = os.path.join(real_data_path, "val")
+    test_set = datasets.ImageFolder(test_dir, transform=eval_transform)
+    test_loader = torch.utils.data.DataLoader(
+        test_set, batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
+    )
+
+    # ── Feature extraction (reuse existing helper) ────────────────────────────
+    train_feats, train_labels = _extract_features(backbone_model, train_loader)
+    test_feats, test_labels = _extract_features(backbone_model, test_loader)
+
+    X_tr = train_feats.numpy()
+    y_tr = train_labels.numpy()
+    X_te = test_feats.numpy()
+    y_te = test_labels.numpy()
+
+    # ── sklearn LogisticRegression ────────────────────────────────────────────
+    clf = LogisticRegression(max_iter=1000, C=1.0, random_state=args.lp_split_seed, n_jobs=-1)
+    clf.fit(X_tr, y_tr)
+
+    train_acc = clf.score(X_tr, y_tr) * 100.0
+
+    proba = clf.predict_proba(X_te)           # (N_test, num_classes)
+    top5_idx = np.argsort(proba, axis=1)[:, -5:]
+    test_acc_top1 = (proba.argmax(axis=1) == y_te).mean() * 100.0
+    test_acc_top5 = np.mean([y_te[i] in top5_idx[i] for i in range(len(y_te))]) * 100.0
+
+    print(f"Epoch {epoch} | LP ({len(train_subset)} train, {len(test_set)} test): "
+          f"train={train_acc:.1f}%  top1={test_acc_top1:.1f}%  top5={test_acc_top5:.1f}%")
+
+    backbone_model.train()
+    return {"train_acc": train_acc, "test_acc_top1": test_acc_top1, "test_acc_top5": test_acc_top5}
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,

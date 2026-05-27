@@ -1,17 +1,18 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import sys
 import argparse
 import json
 from pathlib import Path
@@ -27,6 +28,38 @@ from torchvision import models as torchvision_models
 import utils
 import vision_transformer as vits
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
+
+def build_stratified_subset(dataset, fraction, seed=0):
+    """Return a Subset of dataset with `fraction` of each class, stratified."""
+    if fraction >= 1.0:
+        return dataset
+
+    targets = [s[1] for s in dataset.samples]
+
+    try:
+        from sklearn.model_selection import StratifiedShuffleSplit
+        sss = StratifiedShuffleSplit(n_splits=1, train_size=fraction, random_state=seed)
+        indices, _ = next(sss.split(targets, targets))
+    except ImportError:
+        from collections import defaultdict
+        import random as _random
+        rng = _random.Random(seed)
+        class_to_indices = defaultdict(list)
+        for idx, label in enumerate(targets):
+            class_to_indices[label].append(idx)
+        indices = []
+        for idx_list in class_to_indices.values():
+            k = max(1, round(fraction * len(idx_list)))
+            indices.extend(rng.sample(idx_list, k))
+
+    return torch.utils.data.Subset(dataset, sorted(indices))
+
 
 def eval_linear(args):
     utils.init_distributed_mode(args)
@@ -34,16 +67,43 @@ def eval_linear(args):
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
 
-    # ============ building network ... ============
-    # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
+    # ============ resolve evaluation split ============
+    if args.eval_split == 'auto':
+        test_dir = os.path.join(args.data_path, "test")
+        val_dir = os.path.join(args.data_path, "val")
+        eval_dir = test_dir if os.path.isdir(test_dir) else val_dir
+    elif args.eval_split == 'test':
+        eval_dir = os.path.join(args.data_path, "test")
+    else:
+        eval_dir = os.path.join(args.data_path, "val")
+    print(f"Using evaluation split: {eval_dir}")
+
+    # ============ optional W&B init ============
+    if args.use_wandb and utils.is_main_process():
+        if not _WANDB_AVAILABLE:
+            print("WARNING: wandb not installed, disabling W&B logging.")
+            args.use_wandb = False
+        elif os.environ.get('WANDB_DISABLED', '').lower() in ('true', '1', 'yes'):
+            print("WARNING: WANDB_DISABLED is set, disabling W&B logging.")
+            args.use_wandb = False
+        else:
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=args.wandb_run_name,
+                config=vars(args),
+            )
+            wandb.define_metric("epoch_num")
+            wandb.define_metric("linear/*", step_metric="epoch_num")
+            print(f"W&B run: {wandb.run.name} ({wandb.run.url})")
+
+    # ============ building network ============
     if args.arch in vits.__dict__.keys():
         model = vits.__dict__[args.arch](patch_size=args.patch_size, num_classes=0)
         embed_dim = model.embed_dim * (args.n_last_blocks + int(args.avgpool_patchtokens))
-    # if the network is a XCiT
     elif "xcit" in args.arch:
         model = torch.hub.load('facebookresearch/xcit:main', args.arch, num_classes=0)
         embed_dim = model.embed_dim
-    # otherwise, we check if the architecture is in torchvision models
     elif args.arch in torchvision_models.__dict__.keys():
         model = torchvision_models.__dict__[args.arch]()
         embed_dim = model.fc.weight.shape[1]
@@ -53,7 +113,6 @@ def eval_linear(args):
         sys.exit(1)
     model.cuda()
     model.eval()
-    # load weights to evaluate
     utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
     print(f"Model {args.arch} built.")
 
@@ -61,14 +120,14 @@ def eval_linear(args):
     linear_classifier = linear_classifier.cuda()
     linear_classifier = nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[args.gpu])
 
-    # ============ preparing data ... ============
+    # ============ preparing data ============
     val_transform = pth_transforms.Compose([
         pth_transforms.Resize(256, interpolation=3),
         pth_transforms.CenterCrop(224),
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
+    dataset_val = datasets.ImageFolder(eval_dir, transform=val_transform)
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
@@ -78,7 +137,7 @@ def eval_linear(args):
 
     if args.evaluate:
         utils.load_pretrained_linear_weights(linear_classifier, args.arch, args.patch_size)
-        test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
+        test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens, args.arch)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
 
@@ -88,7 +147,8 @@ def eval_linear(args):
         pth_transforms.ToTensor(),
         pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
+    dataset_train_full = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
+    dataset_train = build_stratified_subset(dataset_train_full, args.train_fraction, seed=args.seed)
     sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
@@ -97,14 +157,16 @@ def eval_linear(args):
         num_workers=args.num_workers,
         pin_memory=True,
     )
-    print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
+    print(f"Data loaded with {len(dataset_train)} train "
+          f"({args.train_fraction*100:.0f}% of {len(dataset_train_full)}) "
+          f"and {len(dataset_val)} val imgs.")
 
     # set optimizer
     optimizer = torch.optim.SGD(
         linear_classifier.parameters(),
-        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256., # linear scaling rule
+        args.lr * (args.batch_size_per_gpu * utils.get_world_size()) / 256.,
         momentum=0.9,
-        weight_decay=0, # we do not apply weight decay
+        weight_decay=0,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs, eta_min=0)
 
@@ -123,18 +185,21 @@ def eval_linear(args):
     for epoch in range(start_epoch, args.epochs):
         train_loader.sampler.set_epoch(epoch)
 
-        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens)
+        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens, args.arch)
         scheduler.step()
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     'epoch': epoch}
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()}, 'epoch': epoch}
+        wb_log = {'epoch_num': epoch, **{f'linear/train_{k}': v for k, v in train_stats.items()}}
+
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-            test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
+            test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens, args.arch)
             print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}%')
-            log_stats = {**{k: v for k, v in log_stats.items()},
-                         **{f'test_{k}': v for k, v in test_stats.items()}}
+            log_stats = {**log_stats, **{f'test_{k}': v for k, v in test_stats.items()}}
+            wb_log.update({f'linear/val_{k}': v for k, v in test_stats.items()})
+            wb_log['linear/best_acc1'] = best_acc
+
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -146,23 +211,27 @@ def eval_linear(args):
                 "best_acc": best_acc,
             }
             torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
+            if args.use_wandb:
+                wandb.log(wb_log)
+
     print("Training of the supervised linear classifier on frozen features completed.\n"
-                "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
+          "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
+
+    if args.use_wandb and utils.is_main_process():
+        wandb.finish()
 
 
-def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
+def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, arch):
     linear_classifier.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     for (inp, target) in metric_logger.log_every(loader, 20, header):
-        # move to gpu
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
-        # forward
         with torch.no_grad():
-            if "vit" in args.arch:
+            if "vit" in arch:
                 intermediate_output = model.get_intermediate_layers(inp, n)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
@@ -172,39 +241,31 @@ def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
                 output = model(inp)
         output = linear_classifier(output)
 
-        # compute cross entropy loss
         loss = nn.CrossEntropyLoss()(output, target)
 
-        # compute the gradients
         optimizer.zero_grad()
         loss.backward()
-
-        # step
         optimizer.step()
 
-        # log 
         torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-    # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 @torch.no_grad()
-def validate_network(val_loader, model, linear_classifier, n, avgpool):
+def validate_network(val_loader, model, linear_classifier, n, avgpool, arch):
     linear_classifier.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
     for inp, target in metric_logger.log_every(val_loader, 20, header):
-        # move to gpu
         inp = inp.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
 
-        # forward
         with torch.no_grad():
-            if "vit" in args.arch:
+            if "vit" in arch:
                 intermediate_output = model.get_intermediate_layers(inp, n)
                 output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
                 if avgpool:
@@ -227,10 +288,10 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
             metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
     if linear_classifier.module.num_labels >= 5:
         print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+              .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
     else:
         print('* Acc@1 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'
-          .format(top1=metric_logger.acc1, losses=metric_logger.loss))
+              .format(top1=metric_logger.acc1, losses=metric_logger.loss))
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
@@ -244,19 +305,16 @@ class LinearClassifier(nn.Module):
         self.linear.bias.data.zero_()
 
     def forward(self, x):
-        # flatten
         x = x.view(x.size(0), -1)
-
-        # linear layer
         return self.linear(x)
 
 
-if __name__ == '__main__':
+def get_args_parser():
     parser = argparse.ArgumentParser('Evaluation with linear classification on ImageNet')
     parser.add_argument('--n_last_blocks', default=4, type=int, help="""Concatenate [CLS] tokens
         for the `n` last blocks. We use `n=4` when evaluating ViT-Small and `n=1` with ViT-Base.""")
     parser.add_argument('--avgpool_patchtokens', default=False, type=utils.bool_flag,
-        help="""Whether ot not to concatenate the global average pooled features to the [CLS] token.
+        help="""Whether or not to concatenate the global average pooled features to the [CLS] token.
         We typically set this to False for ViT-Small and to True with ViT-Base.""")
     parser.add_argument('--arch', default='vit_small', type=str, help='Architecture')
     parser.add_argument('--patch_size', default=16, type=int, help='Patch resolution of the model.')
@@ -265,8 +323,7 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument("--lr", default=0.001, type=float, help="""Learning rate at the beginning of
         training (highest LR used during training). The learning rate is linearly scaled
-        with the batch size, and specified here for a reference batch size of 256.
-        We recommend tweaking the LR depending on the checkpoint evaluated.""")
+        with the batch size, and specified here for a reference batch size of 256.""")
     parser.add_argument('--batch_size_per_gpu', default=128, type=int, help='Per-GPU batch-size')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
@@ -275,7 +332,22 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")
     parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
-    parser.add_argument('--num_labels', default=1000, type=int, help='Number of labels for linear classifier')
+    parser.add_argument('--num_labels', default=20, type=int, help='Number of labels for linear classifier')
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
+    parser.add_argument('--train_fraction', default=1.0, type=float,
+        help='Fraction of training data to use (e.g. 0.01 for 1%%, 0.05 for 5%%). Default: 1.0 (full dataset).')
+    parser.add_argument('--eval_split', default='auto', type=str, choices=['auto', 'val', 'test'],
+        help='Evaluation split to use. "auto" checks for test/ first, falls back to val/.')
+    parser.add_argument('--seed', default=0, type=int, help='Random seed for stratified sampling.')
+    parser.add_argument('--use_wandb', type=utils.bool_flag, default=False, help='Enable Weights & Biases logging.')
+    parser.add_argument('--wandb_project', default='dino-aqua20', type=str, help='W&B project name.')
+    parser.add_argument('--wandb_entity', default=None, type=str, help='W&B entity (username or team).')
+    parser.add_argument('--wandb_run_name', default=None, type=str, help='W&B run name.')
+    return parser
+
+
+if __name__ == '__main__':
+    parser = get_args_parser()
     args = parser.parse_args()
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     eval_linear(args)
