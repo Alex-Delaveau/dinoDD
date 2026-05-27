@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dino-run-a-full-dev
 #SBATCH --account=rbw@v100
-#SBATCH --partition=gpu_p2
 #SBATCH --constraint=v100-32g
 #SBATCH --hint=nomultithread
 #SBATCH --qos=qos_gpu-dev
