@@ -17,7 +17,6 @@ module purge
 module load pytorch-gpu/py3/2.1.1
 
 # ── Paths (override via environment before sbatch) ───────────────────────────
-# DATA_PATH: ImageFolder root for AQUA20 (with class subdirectories directly, no /train append)
 DATA_PATH=${DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20/data/aqua20/}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORK/dino_runs/run_a_aqua20_full_$SLURM_JOB_ID}
 CODE_DIR=${CODE_DIR:-$WORK/projects/dinoDD}
@@ -26,7 +25,7 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p logs
 
 # ── Launch ───────────────────────────────────────────────────────────────────
-torchrun \
+srun torchrun \
     --nproc_per_node=$SLURM_GPUS_ON_NODE \
     --nnodes=$SLURM_NNODES \
     --rdzv_id=$SLURM_JOB_ID \
@@ -37,10 +36,20 @@ torchrun \
     --optimizer lars \
     --use_fp16 false \
     --use_bn_in_head true \
+    --norm_last_layer false \
     --data_path "$DATA_PATH" \
     --epochs 100 \
     --batch_size_per_gpu 64 \
     --num_workers 8 \
+    --lr 0.3 \
+    --min_lr 0.0048 \
+    --warmup_epochs 10 \
+    --weight_decay 1e-6 \
+    --weight_decay_end 1e-6 \
+    --warmup_teacher_temp_epochs 30 \
+    --warmup_teacher_temp 0.04 \
+    --teacher_temp 0.07 \
+    --momentum_teacher 0.9995 \
     --output_dir "$OUTPUT_DIR" \
     --saveckp_freq 20 \
     --lp_eval_freq 10 \
