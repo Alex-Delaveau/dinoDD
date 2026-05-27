@@ -38,7 +38,7 @@ srun torchrun \
     --use_bn_in_head true \
     --norm_last_layer false \
     --data_path "$DATA_PATH" \
-    --epochs 100 \
+    --epochs 600 \
     --batch_size_per_gpu 64 \
     --num_workers 8 \
     --lr 0.3 \
@@ -51,8 +51,8 @@ srun torchrun \
     --teacher_temp 0.07 \
     --momentum_teacher 0.9995 \
     --output_dir "$OUTPUT_DIR" \
-    --saveckp_freq 20 \
-    --lp_eval_freq 10 \
+    --saveckp_freq 25 \
+    --lp_eval_freq 25 \
     --lp_train_frac 0.05 \
     --lp_split_seed 42 \
     --lp_real_data_path "$DATA_PATH" \

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dino-run-b-distilled
+#SBATCH --job-name=dino-run-c-distilled-no-physics
 #SBATCH --account=rbw@v100
 #SBATCH --constraint=v100-32g
 #SBATCH --hint=nomultithread
@@ -18,9 +18,9 @@ module load pytorch-gpu/py3/2.1.1
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # DISTILLED_DATA: path to the distilled .pth file (dict with "images" and "labels" keys)
-DISTILLED_DATA=${DISTILLED_DATA:-$WORK/projects/GradientDistillation/logged_files/distillation/aqua20/dinov2_vitb/dinov2_vitb_distill_252_ipc1_augs10_seathru_v100_32g/data.pth}
+DISTILLED_DATA=${DISTILLED_DATA:-$WORK/projects/GradientDistillation/logged_files/distillation/aqua20/dinov2_vitb/dinov2_vitb_distill_252_ipc1_augs10_v100_32g/data.pth}
 REAL_DATA_PATH=${REAL_DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20/data/aqua20/}
-OUTPUT_DIR=${OUTPUT_DIR:-$WORK/dino_runs/run_b_distilled_$SLURM_JOB_ID}
+OUTPUT_DIR=${OUTPUT_DIR:-$WORK/dino_runs/run_c_distilled_no_physics_$SLURM_JOB_ID}
 CODE_DIR=${CODE_DIR:-$WORK/projects/dinoDD}
 
 mkdir -p "$OUTPUT_DIR"
@@ -70,8 +70,8 @@ srun torchrun \
     --dist_url "env://"
 
 # Usage:
-#   DISTILLED_DATA=<PATH_TO_DISTILLED_PT> sbatch slurm/run_b_distilled.slurm
-#   DISTILLED_DATA=<PATH> REAL_DATA_PATH=/custom/aqua20 sbatch slurm/run_b_distilled.slurm
+#   DISTILLED_DATA=<PATH_TO_DISTILLED_PT> sbatch slurm/run_c_distilled_no_physics.slurm
+#   DISTILLED_DATA=<PATH> REAL_DATA_PATH=/custom/aqua20 sbatch slurm/run_c_distilled_no_physics.slurm
 #
 # To resume from checkpoint (auto-detected by main_dino_aqua.py):
-#   OUTPUT_DIR=$WORK/dino_runs/run_b_distilled_<old_job_id> DISTILLED_DATA=<PATH> sbatch slurm/run_b_distilled.slurm
+#   OUTPUT_DIR=$WORK/dino_runs/run_c_distilled_no_physics_<old_job_id> DISTILLED_DATA=<PATH> sbatch slurm/run_c_distilled_no_physics.slurm
