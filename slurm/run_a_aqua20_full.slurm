@@ -26,7 +26,7 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p logs
 
 # ── Launch ───────────────────────────────────────────────────────────────────
-srun torchrun \
+torchrun \
     --nproc_per_node=$SLURM_GPUS_ON_NODE \
     --nnodes=$SLURM_NNODES \
     --rdzv_id=$SLURM_JOB_ID \

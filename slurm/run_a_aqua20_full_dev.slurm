@@ -25,7 +25,7 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p logs
 
 # ── Launch (5 epochs, lp_eval_freq=1 to trigger LP on epoch 1) ───────────────
-srun torchrun \
+torchrun \
     --nproc_per_node=$SLURM_GPUS_ON_NODE \
     --nnodes=$SLURM_NNODES \
     --rdzv_id=$SLURM_JOB_ID \
