@@ -41,6 +41,16 @@ srun torchrun \
     --optimizer lars \
     --use_fp16 false \
     --use_bn_in_head true \
+    --norm_last_layer false \
+    --lr 0.3 \
+    --min_lr 0.0048 \
+    --warmup_epochs 10 \
+    --weight_decay 1e-6 \
+    --weight_decay_end 1e-6 \
+    --warmup_teacher_temp 0.04 \
+    --warmup_teacher_temp_epochs 60 \
+    --teacher_temp 0.07 \
+    --momentum_teacher 0.9995 \
     --num_workers 4 \
     --output_dir "$OUTPUT_DIR" \
     --saveckp_freq 50 \
