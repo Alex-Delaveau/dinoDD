@@ -17,7 +17,7 @@ module purge
 module load pytorch-gpu/py3/2.1.1
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DISTILLED_DATA=${DISTILLED_DATA:?Must set DISTILLED_DATA (path to distilled .pth file)}
+DISTILLED_DATA=${DISTILLED_DATA:-$WORK/projects/GradientDistillation/logged_files/distillation/aqua20/dinov2_vitb/dinov2_vitb_distill_252_ipc1_augs10_seathru_v100_32g/data.pth}
 REAL_DATA_PATH=${REAL_DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20/data/aqua20/}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORK/dino_runs/run_b_distilled_dev_$SLURM_JOB_ID}
 CODE_DIR=${CODE_DIR:-$WORK/projects/dinoDD}
