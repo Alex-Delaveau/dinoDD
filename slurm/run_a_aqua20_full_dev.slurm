@@ -15,7 +15,7 @@ module purge
 module load pytorch-gpu/py3/2.1.1 cpuarch/amd
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_PATH=${DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20}
+DATA_PATH=${DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20/data/aqua20/}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORK/dino_runs/run_a_aqua20_full_dev_$SLURM_JOB_ID}
 CODE_DIR=${CODE_DIR:-$WORK/dinoDD}
 
@@ -29,8 +29,10 @@ torchrun \
     --rdzv_backend=c10d \
     --rdzv_endpoint=$HOSTNAME:29500 \
     $CODE_DIR/main_dino_aqua.py \
-    --arch vit_small \
-    --patch_size 16 \
+    --arch resnet18 \
+    --optimizer lars \
+    --use_fp16 false \
+    --use_bn_in_head true \
     --data_path "$DATA_PATH" \
     --epochs 5 \
     --batch_size_per_gpu 64 \

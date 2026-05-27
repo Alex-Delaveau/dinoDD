@@ -17,7 +17,7 @@ module load pytorch-gpu/py3/2.1.1 cpuarch/amd
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # DISTILLED_DATA: path to the distilled .pth file (dict with "images" and "labels" keys)
 DISTILLED_DATA=${DISTILLED_DATA:?Must set DISTILLED_DATA (path to distilled .pth file)}
-REAL_DATA_PATH=${REAL_DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20}
+REAL_DATA_PATH=${REAL_DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20/data/aqua20/}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORK/dino_runs/run_b_distilled_$SLURM_JOB_ID}
 CODE_DIR=${CODE_DIR:-$WORK/dinoDD}
 

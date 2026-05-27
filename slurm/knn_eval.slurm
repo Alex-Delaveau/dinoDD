@@ -16,7 +16,7 @@ module load pytorch-gpu/py3/2.1.1 cpuarch/amd
 # ── Paths (override via environment before sbatch) ───────────────────────────
 # DATA_PATH must point to a directory with train/ and test/ (or val/) subdirs (ImageFolder layout).
 PRETRAINED_WEIGHTS=${PRETRAINED_WEIGHTS:?Must set PRETRAINED_WEIGHTS (path to DINO checkpoint.pth)}
-DATA_PATH=${DATA_PATH:?Must set DATA_PATH (root with train/ and test/ subdirs)}
+DATA_PATH=${DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20/data/aqua20/}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORK/dino/knn_eval/$SLURM_JOB_ID}
 CODE_DIR=${CODE_DIR:-$WORK/dinoDD}
 

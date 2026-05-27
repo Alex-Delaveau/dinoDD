@@ -16,7 +16,7 @@ module load pytorch-gpu/py3/2.1.1 cpuarch/amd
 # ── Paths (override via environment before sbatch) ───────────────────────────
 # DATA_PATH must point to the ImageFolder root (with class subdirectories directly).
 # main_dino_aqua.py calls datasets.ImageFolder(args.data_path) without appending /train.
-DATA_PATH=${DATA_PATH:?Must set DATA_PATH (ImageFolder root with class subdirs)}
+DATA_PATH=${DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20/data/aqua20/train}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORK/projects/dino/pretrain_full/$SLURM_JOB_ID}
 CODE_DIR=${CODE_DIR:-$WORK/dinoDD}
 
