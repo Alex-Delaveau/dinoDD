@@ -1,28 +1,31 @@
 #!/bin/bash
 #SBATCH --job-name=dino-run-a-full-dev
-#SBATCH --partition=gpu_p5
-#SBATCH --account=rbw@a100
+#SBATCH --account=rbw@v100
+#SBATCH --constraint=v100-32g
+#SBATCH --hint=nomultithread
 #SBATCH --qos=qos_gpu-dev
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=10
 #SBATCH --time=02:00:00
-#SBATCH --output=%x_%j.out
-#SBATCH --error=%x_%j.err
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+set -e
 
 module purge
-module load pytorch-gpu/py3/2.1.1 cpuarch/amd
+module load pytorch-gpu/py3/2.1.1
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_PATH=${DATA_PATH:-/lustre/fshomisc/home/rech/genlpd01/ucw75ke/work/datasets/aqua20/data/aqua20/}
 OUTPUT_DIR=${OUTPUT_DIR:-$WORK/dino_runs/run_a_aqua20_full_dev_$SLURM_JOB_ID}
-CODE_DIR=${CODE_DIR:-$WORK/dinoDD}
+CODE_DIR=${CODE_DIR:-$WORK/projects/dinoDD}
 
 mkdir -p "$OUTPUT_DIR"
+mkdir -p logs
 
 # ── Launch (5 epochs, lp_eval_freq=1 to trigger LP on epoch 1) ───────────────
-torchrun \
+srun torchrun \
     --nproc_per_node=$SLURM_GPUS_ON_NODE \
     --nnodes=$SLURM_NNODES \
     --rdzv_id=$SLURM_JOB_ID \

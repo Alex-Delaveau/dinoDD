@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dino-pretrain-full
-#SBATCH --partition=gpu_p5
-#SBATCH --account=rbw@a100
+#SBATCH --partition=gpu_p2
+#SBATCH --account=rbw@v100
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
@@ -11,7 +11,7 @@
 #SBATCH --error=%x_%j.err
 
 module purge
-module load pytorch-gpu/py3/2.1.1 cpuarch/amd
+module load pytorch-gpu/py3/2.1.1
 
 # ── Paths (override via environment before sbatch) ───────────────────────────
 # DATA_PATH must point to the ImageFolder root (with class subdirectories directly).
