@@ -6,9 +6,9 @@
 #SBATCH --qos=qos_gpu-t3
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=10
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 set -e
@@ -25,27 +25,17 @@ mkdir -p "$OUTPUT_DIR"
 mkdir -p logs
 
 # ── Launch ───────────────────────────────────────────────────────────────────
-# No --pretrained_weights: ResNet18 keeps its random PyTorch initialization,
-# giving a baseline that shows what linear probing achieves without DINO.
-srun torchrun \
-    --nproc_per_node=$SLURM_GPUS_ON_NODE \
-    --nnodes=$SLURM_NNODES \
-    --rdzv_id=$SLURM_JOB_ID \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint=$HOSTNAME:29500 \
-    $CODE_DIR/eval_linear.py \
+# Random ResNet18 backbone — no pretrained weights.
+# Uses the exact same sklearn LP protocol as run_lp_eval() in main_dino_aqua.py:
+#   LogisticRegression(max_iter=1000, C=1.0), 5% stratified train data, L2-normalised features.
+python $CODE_DIR/eval_lp_sklearn.py \
     --arch resnet18 \
     --data_path "$DATA_PATH" \
-    --train_fraction 1.0 \
-    --eval_split auto \
-    --num_labels 20 \
-    --epochs 100 \
-    --lr 0.001 \
-    --batch_size_per_gpu 128 \
+    --lp_train_frac 0.05 \
+    --lp_split_seed 42 \
+    --batch_size 128 \
     --num_workers 8 \
-    --output_dir "$OUTPUT_DIR" \
-    --use_wandb false \
-    --dist_url "env://"
+    --output_dir "$OUTPUT_DIR"
 
 # Usage:
 #   sbatch slurm/run_d_no_pretrain_baseline.slurm
